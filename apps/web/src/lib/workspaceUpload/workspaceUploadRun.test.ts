@@ -1,4 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
+import { vi } from "vite-plus/test";
 import type { ProjectPrepareUploadInput, ProjectPrepareUploadResult } from "@t3tools/contracts";
 
 import type { DroppedEntries } from "./collectDroppedEntries.ts";
@@ -122,11 +123,11 @@ describe("startWorkspaceUpload", () => {
     const summary = await startWorkspaceUpload({
       cwd: "/w",
       targetDirectory: "",
-      entries: entries("a.txt"),
+      entries: entries("a.txt", "b.txt"),
       deps: server.deps,
       onProgress: () => {},
     }).done;
-    expect(summary).toMatchObject({ uploaded: [], skipped: 1, failed: [] });
+    expect(summary).toMatchObject({ uploaded: ["b.txt"], skipped: 1, failed: [] });
   });
 
   it("refreshes an expired upload URL once", async () => {
@@ -231,5 +232,116 @@ describe("startWorkspaceUpload", () => {
     const summary = await run.done;
     expect(aborted).toBe(2);
     expect(summary).toMatchObject({ cancelled: true, uploaded: [], failed: [] });
+  });
+
+  it("does not send or list a file when cancelled during the URL re-mint", async () => {
+    const server = fakeServer({ statuses: { "a.txt": [404] } });
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let prepares = 0;
+    const deps: WorkspaceUploadDeps = {
+      ...server.deps,
+      prepare: async (input) => {
+        if (++prepares === 2) await gate;
+        return server.deps.prepare(input);
+      },
+    };
+    const run = startWorkspaceUpload({
+      cwd: "/w",
+      targetDirectory: "",
+      entries: entries("a.txt"),
+      deps,
+      onProgress: () => {},
+    });
+    await vi.waitFor(() => expect(prepares).toBe(2));
+    run.cancel();
+    release();
+    const summary = await run.done;
+    expect(server.sent).toHaveLength(1);
+    expect(summary).toMatchObject({ cancelled: true, uploaded: [] });
+  });
+
+  it("stops preparing further batches after cancel", async () => {
+    const server = fakeServer({});
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let prepares = 0;
+    const deps: WorkspaceUploadDeps = {
+      ...server.deps,
+      prepare: async (input) => {
+        prepares++;
+        await gate;
+        return server.deps.prepare(input);
+      },
+    };
+    const run = startWorkspaceUpload({
+      cwd: "/w",
+      targetDirectory: "",
+      entries: entries(...Array.from({ length: 1200 }, (_, i) => `f${i}.txt`)),
+      deps,
+      onProgress: () => {},
+    });
+    await vi.waitFor(() => expect(prepares).toBe(1));
+    run.cancel();
+    release();
+    await run.done;
+    expect(prepares).toBe(1);
+  });
+
+  it("does not count skipped or failed files as uploaded bytes", async () => {
+    const server = fakeServer({ existing: ["a.txt"] });
+    const seen: Array<{ totalBytes: number; uploadedBytes: number }> = [];
+    await startWorkspaceUpload({
+      cwd: "/w",
+      targetDirectory: "",
+      entries: entries("a.txt", "b.txt"),
+      deps: server.deps,
+      onProgress: (p) => seen.push({ totalBytes: p.totalBytes, uploadedBytes: p.uploadedBytes }),
+    }).done;
+    expect(seen.every((p) => p.uploadedBytes <= 3)).toBe(true);
+    expect(seen.at(-1)).toEqual({ totalBytes: 3, uploadedBytes: 3 });
+  });
+
+  it("still resolves with a summary when the conflict dialog fails", async () => {
+    const server = fakeServer({ existing: ["a.txt"] });
+    const deps: WorkspaceUploadDeps = {
+      ...server.deps,
+      resolveConflicts: async () => {
+        throw new Error("dialog closed");
+      },
+    };
+    const summary = await startWorkspaceUpload({
+      cwd: "/w",
+      targetDirectory: "",
+      entries: entries("a.txt", "b.txt"),
+      deps,
+      onProgress: () => {},
+    }).done;
+    expect(summary.failed).toEqual([{ relativePath: "a.txt", reason: "dialog closed" }]);
+    expect(summary.uploaded).toEqual(["b.txt"]);
+  });
+
+  it("records a throwing send as a failure and keeps the other files going", async () => {
+    const server = fakeServer({});
+    const deps: WorkspaceUploadDeps = {
+      ...server.deps,
+      send: (url, file, onProgress) => {
+        if (url.endsWith("a.txt")) throw new Error("boom");
+        return server.deps.send(url, file, onProgress);
+      },
+    };
+    const summary = await startWorkspaceUpload({
+      cwd: "/w",
+      targetDirectory: "",
+      entries: entries("a.txt", "b.txt"),
+      deps,
+      onProgress: () => {},
+    }).done;
+    expect(summary.failed).toEqual([{ relativePath: "a.txt", reason: "boom" }]);
+    expect(summary.uploaded).toEqual(["b.txt"]);
   });
 });

@@ -86,7 +86,8 @@ export function startWorkspaceUpload(input: {
       dropped.file,
     ]),
   );
-  const totalBytes = [...files.values()].reduce((sum, file) => sum + file.size, 0);
+  // Shrinks when a file is skipped or fails, so the byte bar only counts bytes that can still move.
+  let totalBytes = [...files.values()].reduce((sum, file) => sum + file.size, 0);
   const loadedBytes = new Map<string, number>();
   const uploaded: string[] = [];
   const failed: Array<{ relativePath: string; reason: string }> = [];
@@ -101,9 +102,15 @@ export function startWorkspaceUpload(input: {
       totalBytes,
       uploadedBytes: [...loadedBytes.values()].reduce((sum, bytes) => sum + bytes, 0),
     });
-  const finish = (relativePath: string) => {
+  const finish = (relativePath: string, wasUploaded = false) => {
     finishedFiles += 1;
-    loadedBytes.set(relativePath, files.get(relativePath)?.size ?? 0);
+    const size = files.get(relativePath)?.size ?? 0;
+    if (wasUploaded) {
+      loadedBytes.set(relativePath, size);
+    } else {
+      loadedBytes.delete(relativePath);
+      totalBytes -= size;
+    }
     report();
   };
   const fail = (relativePath: string, reason: string) => {
@@ -152,7 +159,11 @@ export function startWorkspaceUpload(input: {
     while ((pending.length > 0 || pendingDirectories.length > 0) && !cancelled) {
       const modes = new Map(pending.map((request) => [request.relativePath, request.mode]));
       const conflicts: UploadConflict[] = [];
-      for (let offset = 0; offset < Math.max(pending.length, 1); offset += PREPARE_BATCH_SIZE) {
+      for (
+        let offset = 0;
+        offset < Math.max(pending.length, 1) && !cancelled;
+        offset += PREPARE_BATCH_SIZE
+      ) {
         const results = await prepareBatch(
           pending.slice(offset, offset + PREPARE_BATCH_SIZE),
           offset === 0 ? pendingDirectories : [],
@@ -183,7 +194,14 @@ export function startWorkspaceUpload(input: {
         }
         break;
       }
-      const choices = await deps.resolveConflicts(conflicts);
+      let choices: ReadonlyMap<string, UploadConflictChoice>;
+      try {
+        choices = await deps.resolveConflicts(conflicts);
+      } catch (error) {
+        const reason = messageOf(error, "Could not resolve name conflicts.");
+        for (const conflict of conflicts) fail(conflict.relativePath, reason);
+        break;
+      }
       for (const conflict of conflicts) {
         const choice = choices.get(conflict.relativePath) ?? "skip";
         if (choice === "skip") {
@@ -202,6 +220,7 @@ export function startWorkspaceUpload(input: {
     item: ReadyUpload,
     mayRefreshUrl: boolean,
   ): Promise<"done" | "conflict"> {
+    if (cancelled) return "done";
     const file = files.get(item.relativePath);
     const url = deps.resolveUrl(item.relativeUrl);
     if (!file || !url) {
@@ -224,7 +243,7 @@ export function startWorkspaceUpload(input: {
     }
     if (response.status >= 200 && response.status < 300) {
       uploaded.push(response.body || item.relativePath);
-      finish(item.relativePath);
+      finish(item.relativePath, true);
       return "done";
     }
     loadedBytes.set(item.relativePath, 0);
@@ -232,6 +251,7 @@ export function startWorkspaceUpload(input: {
     if (response.status === 404 && mayRefreshUrl && !cancelled) {
       // The signed URL expired while the file waited in the queue.
       const [result] = await prepareBatch([item], []);
+      if (cancelled) return "done";
       if (result?.status === "ready") {
         return uploadOne({ ...item, relativeUrl: result.relativeUrl }, false);
       }
@@ -252,8 +272,12 @@ export function startWorkspaceUpload(input: {
     const worker = async () => {
       while (!cancelled && next < ready.length) {
         const item = ready[next++]!;
-        if ((await uploadOne(item, true)) === "conflict") {
-          late.push({ relativePath: item.relativePath, mode: "fail" });
+        try {
+          if ((await uploadOne(item, true)) === "conflict") {
+            late.push({ relativePath: item.relativePath, mode: "fail" });
+          }
+        } catch (error) {
+          fail(item.relativePath, messageOf(error, "Upload failed."));
         }
       }
     };
