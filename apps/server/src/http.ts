@@ -3,6 +3,7 @@ import {
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
   EnvironmentHttpApi,
+  WORKSPACE_UPLOAD_ROUTE_PREFIX,
 } from "@t3tools/contracts";
 import { isDevProxiedPath } from "@t3tools/shared/devProxy";
 import { decodeOtlpTraceRecords } from "@t3tools/shared/observability";
@@ -46,6 +47,7 @@ import {
   failEnvironmentInternal,
 } from "./auth/http.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+import { storeWorkspaceUpload, validateWorkspaceUploadToken } from "./workspace/WorkspaceUpload.ts";
 import { WEBHOOK_ROUTE_PREFIX } from "./scheduledTasks/ScheduledTaskService.ts";
 import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./httpCors.ts";
 
@@ -481,6 +483,44 @@ export const layerAttachmentUploadRoute = HttpRouter.add(
     const stored = yield* storeAttachmentUpload(claims, Stream.fromPull(Effect.succeed(bodyPull)));
     return stored.ok
       ? HttpServerResponse.empty({ status: 204 })
+      : HttpServerResponse.text(stored.detail, { status: stored.status });
+  }),
+);
+
+// Drag-and-drop uploads into a project folder. The signed token is the authorization;
+// it is minted by the filesystem-write-scoped `projects.prepareUpload` RPC.
+export const layerWorkspaceUploadRoute = HttpRouter.add(
+  "POST",
+  `${WORKSPACE_UPLOAD_ROUTE_PREFIX}/*`,
+  Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest;
+    const url = HttpServerRequest.toURL(request);
+    if (Option.isNone(url)) {
+      return HttpServerResponse.text("Bad Request", { status: 400 });
+    }
+
+    const token = url.value.pathname.slice(`${WORKSPACE_UPLOAD_ROUTE_PREFIX}/`.length);
+    const claims = token ? yield* validateWorkspaceUploadToken(token) : null;
+    if (!claims) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+
+    const contentLengthHeader = request.headers["content-length"];
+    if (
+      contentLengthHeader !== undefined &&
+      (!Number.isInteger(Number(contentLengthHeader)) ||
+        Number(contentLengthHeader) !== claims.sizeBytes)
+    ) {
+      return HttpServerResponse.text("Content-Length must match the upload size.", {
+        status: 400,
+      });
+    }
+
+    // Keep the request stream in the route scope until the response is sent.
+    const bodyPull = yield* Stream.toPull(request.stream);
+    const stored = yield* storeWorkspaceUpload(claims, Stream.fromPull(Effect.succeed(bodyPull)));
+    return stored.ok
+      ? HttpServerResponse.text(stored.relativePath, { status: 200 })
       : HttpServerResponse.text(stored.detail, { status: stored.status });
   }),
 );

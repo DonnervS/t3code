@@ -19,6 +19,7 @@ import type {
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
 } from "@t3tools/contracts";
+import { WORKSPACE_UPLOAD_PART_SUFFIX } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { isExplicitRelativePath, isWindowsAbsolutePath } from "@t3tools/shared/path";
 import { normalizeSearchQuery } from "@t3tools/shared/searchRanking";
@@ -307,7 +308,13 @@ export const make = Effect.gen(function* () {
             }
             const children = await NodeFSP.readdir(directory, { withFileTypes: true });
             return children.flatMap((child): ProjectEntry[] => {
-              if (child.name === ".git" || (!child.isDirectory() && !child.isFile())) return [];
+              // Uploads in progress stream into hidden part files next to their target.
+              if (
+                child.name === ".git" ||
+                child.name.endsWith(WORKSPACE_UPLOAD_PART_SUFFIX) ||
+                (!child.isDirectory() && !child.isFile())
+              )
+                return [];
               return [
                 {
                   path: target.relativePath ? `${target.relativePath}/${child.name}` : child.name,

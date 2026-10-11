@@ -96,6 +96,19 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
   });
 
   describe("list", () => {
+    it.effect("hides upload part files", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir();
+        yield* writeTextFile(cwd, "docs/.report.pdf.1234.t3upload.part", "partial");
+        yield* writeTextFile(cwd, "docs/kept.txt");
+        const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
+        expect(yield* workspaceEntries.list({ cwd, directoryPath: "docs" })).toEqual({
+          entries: [{ path: "docs/kept.txt", kind: "file" }],
+          truncated: false,
+        });
+      }),
+    );
+
     it.effect("lists immediate children including ignored and empty directories", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTempDir({ git: true });

@@ -1,13 +1,15 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { expect, it } from "@effect/vitest";
+import { describe, expect, it } from "@effect/vitest";
 import { WORKSPACE_UPLOAD_MAX_FILE_BYTES, WORKSPACE_UPLOAD_ROUTE_PREFIX } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
@@ -16,7 +18,13 @@ import * as ServerConfig from "../config.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
-import { prepareWorkspaceUpload, validateWorkspaceUploadToken } from "./WorkspaceUpload.ts";
+import {
+  placeUploadedFile,
+  prepareWorkspaceUpload,
+  storeWorkspaceUpload,
+  validateWorkspaceUploadToken,
+  withCopySuffix,
+} from "./WorkspaceUpload.ts";
 
 const layerTest = Layer.mergeAll(
   WorkspacePaths.layer,
@@ -258,5 +266,224 @@ it.layer(layerTest)("WorkspaceUpload.prepare", (it) => {
       expect(NodeFS.existsSync(stale)).toBe(false);
       expect(NodeFS.existsSync(fresh)).toBe(true);
     }),
+  );
+});
+
+describe("withCopySuffix", () => {
+  it("numbers the stem and keeps the last extension", () => {
+    const dir = NodePath.join("a", "b");
+    expect(withCopySuffix(NodePath.join(dir, "report.pdf"), 1)).toBe(
+      NodePath.join(dir, "report (1).pdf"),
+    );
+    expect(withCopySuffix(NodePath.join(dir, "archive.tar.gz"), 2)).toBe(
+      NodePath.join(dir, "archive.tar (2).gz"),
+    );
+    expect(withCopySuffix(NodePath.join(dir, ".env"), 1)).toBe(NodePath.join(dir, ".env (1)"));
+    expect(withCopySuffix(NodePath.join(dir, "Makefile"), 3)).toBe(
+      NodePath.join(dir, "Makefile (3)"),
+    );
+  });
+});
+
+const prepareOne = (
+  cwd: string,
+  relativePath: string,
+  contents: string,
+  onConflict: "fail" | "replace" | "keepBoth",
+) =>
+  Effect.gen(function* () {
+    const result = yield* prepareWorkspaceUpload({
+      cwd,
+      directories: [],
+      files: [{ relativePath, sizeBytes: Buffer.byteLength(contents), onConflict }],
+    });
+    const file = result.files[0];
+    if (file?.status !== "ready") throw new Error(`expected ready, got ${file?.status}`);
+    const claims = yield* validateWorkspaceUploadToken(tokenOf(file.relativeUrl));
+    if (!claims) throw new Error("expected valid claims");
+    return claims;
+  });
+
+const bytes = (text: string) => new TextEncoder().encode(text);
+const partFilesIn = (directory: string) =>
+  NodeFS.readdirSync(directory).filter((name) => name.endsWith(".t3upload.part"));
+
+it.layer(layerTest)("WorkspaceUpload.store", (it) => {
+  it.effect("writes a new file and leaves no part file", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const claims = yield* prepareOne(cwd, "docs/a.txt", "hello", "fail");
+      expect(yield* storeWorkspaceUpload(claims, bytes("hello"))).toEqual({
+        ok: true,
+        relativePath: "docs/a.txt",
+      });
+      expect(NodeFS.readFileSync(NodePath.join(cwd, "docs/a.txt"), "utf8")).toBe("hello");
+      expect(partFilesIn(NodePath.join(cwd, "docs"))).toEqual([]);
+    }),
+  );
+
+  it.effect("stores a streamed zero-byte file", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const claims = yield* prepareOne(cwd, "empty.txt", "", "fail");
+      expect(yield* storeWorkspaceUpload(claims, Stream.empty)).toEqual({
+        ok: true,
+        relativePath: "empty.txt",
+      });
+      expect(NodeFS.readFileSync(NodePath.join(cwd, "empty.txt"), "utf8")).toBe("");
+    }),
+  );
+
+  it.effect("returns a conflict when the target appears during the upload", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const claims = yield* prepareOne(cwd, "a.txt", "new", "fail");
+      writeFile(cwd, "a.txt", "written by an agent");
+      expect(yield* storeWorkspaceUpload(claims, bytes("new"))).toMatchObject({
+        ok: false,
+        status: 409,
+      });
+      expect(NodeFS.readFileSync(NodePath.join(cwd, "a.txt"), "utf8")).toBe("written by an agent");
+      expect(partFilesIn(cwd)).toEqual([]);
+    }),
+  );
+
+  it.effect("replaces an existing file when asked to", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      writeFile(cwd, "a.txt", "old");
+      const claims = yield* prepareOne(cwd, "a.txt", "new", "replace");
+      expect(yield* storeWorkspaceUpload(claims, bytes("new"))).toEqual({
+        ok: true,
+        relativePath: "a.txt",
+      });
+      expect(NodeFS.readFileSync(NodePath.join(cwd, "a.txt"), "utf8")).toBe("new");
+    }),
+  );
+
+  it.effect("keeps both by numbering the new file", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      writeFile(cwd, "r.pdf", "one");
+      writeFile(cwd, "r (1).pdf", "two");
+      const claims = yield* prepareOne(cwd, "r.pdf", "three", "keepBoth");
+      expect(yield* storeWorkspaceUpload(claims, bytes("three"))).toEqual({
+        ok: true,
+        relativePath: "r (2).pdf",
+      });
+      expect(NodeFS.readFileSync(NodePath.join(cwd, "r.pdf"), "utf8")).toBe("one");
+      expect(NodeFS.readFileSync(NodePath.join(cwd, "r (2).pdf"), "utf8")).toBe("three");
+    }),
+  );
+
+  it.effect("keeps a folder and stores the file next to it", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      NodeFS.mkdirSync(NodePath.join(cwd, "data"));
+      const claims = yield* prepareOne(cwd, "data", "x", "keepBoth");
+      expect(yield* storeWorkspaceUpload(claims, bytes("x"))).toEqual({
+        ok: true,
+        relativePath: "data (1)",
+      });
+      expect(NodeFS.statSync(NodePath.join(cwd, "data")).isDirectory()).toBe(true);
+    }),
+  );
+
+  it.effect("rejects a body whose size does not match and cleans up", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const claims = yield* prepareOne(cwd, "a.txt", "hello", "fail");
+      expect(yield* storeWorkspaceUpload(claims, Stream.make(bytes("hello world")))).toMatchObject({
+        ok: false,
+        status: 400,
+      });
+      expect(yield* storeWorkspaceUpload(claims, Stream.make(bytes("hi")))).toMatchObject({
+        ok: false,
+        status: 400,
+      });
+      expect(NodeFS.existsSync(NodePath.join(cwd, "a.txt"))).toBe(false);
+      expect(partFilesIn(cwd)).toEqual([]);
+    }),
+  );
+
+  it.effect("removes the part file when the body stream fails", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const claims = yield* prepareOne(cwd, "a.txt", "hello", "fail");
+      const broken = Stream.concat(
+        Stream.make(bytes("he")),
+        Stream.fail(new Error("connection reset")),
+      );
+      expect(yield* storeWorkspaceUpload(claims, broken)).toMatchObject({
+        ok: false,
+        status: 500,
+      });
+      expect(partFilesIn(cwd)).toEqual([]);
+      expect(NodeFS.existsSync(NodePath.join(cwd, "a.txt"))).toBe(false);
+    }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)(
+    "replaces a symlinked target without writing through it",
+    () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir;
+        const outside = yield* makeTempDir;
+        writeFile(outside, "secret.txt", "outside");
+        NodeFS.symlinkSync(NodePath.join(outside, "secret.txt"), NodePath.join(cwd, "link.txt"));
+        const claims = yield* prepareOne(cwd, "link.txt", "inside", "replace");
+        expect(yield* storeWorkspaceUpload(claims, bytes("inside"))).toEqual({
+          ok: true,
+          relativePath: "link.txt",
+        });
+        expect(NodeFS.readFileSync(NodePath.join(outside, "secret.txt"), "utf8")).toBe("outside");
+        expect(NodeFS.lstatSync(NodePath.join(cwd, "link.txt")).isSymbolicLink()).toBe(false);
+      }),
+  );
+
+  it.effect("rejects with 403 when the path stopped being allowed after signing", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const claims = yield* prepareOne(cwd, "a.txt", "x", "fail");
+      expect(
+        yield* storeWorkspaceUpload({ ...claims, relativePath: ".git/config" }, bytes("x")),
+      ).toMatchObject({ ok: false, status: 403 });
+    }),
+  );
+});
+
+describe("placeUploadedFile", () => {
+  const withTempDir = async (run: (dir: string) => Promise<void>) => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-place-"));
+    try {
+      await run(dir);
+    } finally {
+      NodeFS.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("reports a conflict instead of replacing a folder", async () => {
+    await withTempDir(async (dir) => {
+      NodeFS.mkdirSync(NodePath.join(dir, "target"));
+      NodeFS.writeFileSync(NodePath.join(dir, "part"), "x");
+      await expect(
+        placeUploadedFile(NodePath.join(dir, "part"), NodePath.join(dir, "target"), "replace"),
+      ).resolves.toEqual({ status: "conflict" });
+    });
+  });
+
+  it.skipIf(!symlinksSupported)(
+    "reports a conflict instead of replacing a directory symlink",
+    async () => {
+      await withTempDir(async (dir) => {
+        NodeFS.mkdirSync(NodePath.join(dir, "real"));
+        NodeFS.symlinkSync(NodePath.join(dir, "real"), NodePath.join(dir, "link"), "junction");
+        NodeFS.writeFileSync(NodePath.join(dir, "part"), "x");
+        await expect(
+          placeUploadedFile(NodePath.join(dir, "part"), NodePath.join(dir, "link"), "replace"),
+        ).resolves.toEqual({ status: "conflict" });
+        expect(NodeFS.statSync(NodePath.join(dir, "real")).isDirectory()).toBe(true);
+      });
+    },
   );
 });
