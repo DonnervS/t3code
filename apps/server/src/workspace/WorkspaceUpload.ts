@@ -307,25 +307,37 @@ export function withCopySuffix(filePath: string, copy: number): string {
  * Moves the part file to `targetPath` only if that name is still free. A hard
  * link fails atomically with EEXIST, so a file an agent writes meanwhile wins.
  */
-async function placeExclusive(partPath: string, targetPath: string): Promise<boolean> {
+// `ops` is a test seam for failures that are hard to provoke on a real filesystem.
+export async function placeExclusive(
+  partPath: string,
+  targetPath: string,
+  ops: Pick<typeof NodeFSP, "link" | "open" | "rename" | "rm" | "unlink"> = NodeFSP,
+): Promise<boolean> {
   try {
-    await NodeFSP.link(partPath, targetPath);
+    await ops.link(partPath, targetPath);
   } catch (cause) {
     if (isNodeError(cause, "EEXIST")) return false;
     if (!LINK_UNSUPPORTED_CODES.some((code) => isNodeError(cause, code))) throw cause;
     // No hard links here: reserve the name exclusively, then move the bytes over it.
     try {
-      await (await NodeFSP.open(targetPath, "wx")).close();
+      await (await ops.open(targetPath, "wx")).close();
     } catch (reserveCause) {
       if (["EEXIST", "EISDIR", "EPERM"].some((code) => isNodeError(reserveCause, code))) {
         return false;
       }
       throw reserveCause;
     }
-    await NodeFSP.rename(partPath, targetPath);
+    try {
+      await ops.rename(partPath, targetPath);
+    } catch (moveCause) {
+      // The exclusive create proved the name was ours, so don't leave an empty file behind.
+      await ops.unlink(targetPath).catch(() => undefined);
+      throw moveCause;
+    }
     return true;
   }
-  await NodeFSP.rm(partPath, { force: true });
+  // The file is stored already; the caller removes the part file if this fails.
+  await ops.rm(partPath, { force: true }).catch(() => undefined);
   return true;
 }
 
@@ -372,6 +384,23 @@ export async function placeUploadedFile(
     }
   }
   return { status: "conflict" };
+}
+
+function hasErrorCode(cause: unknown, code: string, depth = 0): boolean {
+  if (typeof cause !== "object" || cause === null || depth > 5) return false;
+  return (
+    isNodeError(cause, code) ||
+    ["cause", "reason"].some((key) =>
+      hasErrorCode((cause as Record<string, unknown>)[key], code, depth + 1),
+    )
+  );
+}
+
+/** Status and user-facing detail for an unexpected failure while storing. */
+export function describeStoreFailure(cause: unknown): { status: number; detail: string } {
+  return hasErrorCode(cause, "ENOSPC")
+    ? { status: 507, detail: "The host's disk is full." }
+    : { status: 500, detail: "Failed to write the uploaded file." };
 }
 
 export type StoreWorkspaceUploadResult =
@@ -438,8 +467,9 @@ export const storeWorkspaceUpload = Effect.fn("WorkspaceUpload.store")(function*
         detail: `Body was ${receivedBytes} bytes, expected ${claims.sizeBytes}.`,
       } satisfies StoreWorkspaceUploadResult;
     }
-    const placed = yield* Effect.tryPromise(() =>
-      placeUploadedFile(partPath, target.absolutePath, claims.onConflict),
+    // Not interruptible: cleanup must not delete the part file while placement is running.
+    const placed = yield* Effect.uninterruptible(
+      Effect.tryPromise(() => placeUploadedFile(partPath, target.absolutePath, claims.onConflict)),
     );
     if (placed.status === "conflict") {
       return {
@@ -461,8 +491,7 @@ export const storeWorkspaceUpload = Effect.fn("WorkspaceUpload.store")(function*
       }).pipe(
         Effect.as({
           ok: false,
-          status: 500,
-          detail: "Failed to write the uploaded file.",
+          ...describeStoreFailure(cause),
         } satisfies StoreWorkspaceUploadResult),
       ),
     ),

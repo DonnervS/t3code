@@ -1,5 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
@@ -19,6 +20,8 @@ import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 import {
+  describeStoreFailure,
+  placeExclusive,
   placeUploadedFile,
   prepareWorkspaceUpload,
   storeWorkspaceUpload,
@@ -486,4 +489,61 @@ describe("placeUploadedFile", () => {
       });
     },
   );
+});
+
+describe("placeExclusive fallback cleanup", () => {
+  const nodeError = (code: string) => Object.assign(new Error(code), { code });
+
+  it("removes the reserved empty file when the move fails", async () => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-excl-"));
+    try {
+      NodeFS.writeFileSync(NodePath.join(dir, "part"), "x");
+      const target = NodePath.join(dir, "target.txt");
+      await expect(
+        placeExclusive(NodePath.join(dir, "part"), target, {
+          ...NodeFSP,
+          link: () => Promise.reject(nodeError("EISDIR")),
+          rename: () => Promise.reject(nodeError("EBUSY")),
+        }),
+      ).rejects.toMatchObject({ code: "EBUSY" });
+      expect(NodeFS.existsSync(target)).toBe(false);
+    } finally {
+      NodeFS.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still reports success when removing the part file after a link fails", async () => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-excl-"));
+    try {
+      NodeFS.writeFileSync(NodePath.join(dir, "part"), "x");
+      const target = NodePath.join(dir, "target.txt");
+      await expect(
+        placeExclusive(NodePath.join(dir, "part"), target, {
+          ...NodeFSP,
+          rm: () => Promise.reject(nodeError("EBUSY")),
+        }),
+      ).resolves.toBe(true);
+      expect(NodeFS.readFileSync(target, "utf8")).toBe("x");
+    } finally {
+      NodeFS.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("describeStoreFailure", () => {
+  it("maps a full disk to 507, also when wrapped", () => {
+    const enospc = Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+    expect(describeStoreFailure(enospc).status).toBe(507);
+    expect(describeStoreFailure({ cause: { cause: enospc } })).toEqual({
+      status: 507,
+      detail: "The host's disk is full.",
+    });
+  });
+
+  it("keeps other failures generic", () => {
+    expect(describeStoreFailure(new Error("boom"))).toEqual({
+      status: 500,
+      detail: "Failed to write the uploaded file.",
+    });
+  });
 });
