@@ -283,7 +283,11 @@ const layerRelayClient = Layer.unwrap(
 const layerHttpServer = Layer.unwrap(
   Effect.gen(function* () {
     const config = yield* ServerConfig.ServerConfig;
-    return NodeHttpServer.layer(() => guardHttpResponseWriteErrors(NodeHttp.createServer()), {
+    // Node ends every request after 5 minutes by default, which kills large workspace
+    // uploads on slower links. 3 hours outlasts the client's own timeout for a 2 GB upload
+    // (2 min + size at 256 KB/s, about 2.3 h) and keeps a bound. Node has no per-route setting.
+    const createServer = () => NodeHttp.createServer({ requestTimeout: 3 * 60 * 60_000 });
+    return NodeHttpServer.layer(() => guardHttpResponseWriteErrors(createServer()), {
       host: config.host ?? "127.0.0.1",
       port: config.port,
       gracefulShutdownTimeout: HTTP_PREEMPTIVE_SHUTDOWN_GRACE_MS,
@@ -702,6 +706,7 @@ const layerMakeRoutes = Layer.mergeAll(
     ServerHttp.layerOtlpTracesProxyRoute,
     ServerHttp.layerAssetRoute,
     ServerHttp.layerAttachmentUploadRoute,
+    ServerHttp.layerWorkspaceUploadRoute,
     DeviceHubProxy.layer,
     ServerBrowserStream.routeLayer,
     ServerHttp.layerStaticAndDevRoute,

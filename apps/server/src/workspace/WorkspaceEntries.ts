@@ -7,6 +7,7 @@ import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as RcMap from "effect/RcMap";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 
 import type {
   FilesystemBrowseInput,
@@ -19,6 +20,7 @@ import type {
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
 } from "@t3tools/contracts";
+import { WORKSPACE_UPLOAD_PART_SUFFIX } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { isExplicitRelativePath, isWindowsAbsolutePath } from "@t3tools/shared/path";
 import { normalizeSearchQuery } from "@t3tools/shared/searchRanking";
@@ -103,6 +105,11 @@ export class WorkspaceEntries extends Context.Service<
       input: ProjectSearchContentsInput,
     ) => Effect.Effect<ProjectSearchContentsResult, WorkspaceEntriesError>;
     readonly refresh: (cwd: string) => Effect.Effect<void>;
+    /**
+     * `refresh` without waiting for it, for callers on a response path. Requests for a
+     * folder that arrive while its refresh runs collapse into one more refresh.
+     */
+    readonly refreshInBackground: (cwd: string) => Effect.Effect<void>;
   }
 >()("t3/workspace/WorkspaceEntries") {}
 
@@ -133,6 +140,41 @@ const resolveBrowseTarget = Effect.fn("WorkspaceEntries.resolveBrowseTarget")(fu
     input.partialPath,
   );
 });
+
+/**
+ * Fire-and-forget `refresh` per key: at most one run in flight and one queued, however
+ * often it is requested meanwhile. Runs are forked into `scope`.
+ */
+export function coalesceRefreshes(
+  refresh: (cwd: string) => Effect.Effect<void>,
+  scope: Scope.Scope,
+): (cwd: string) => Effect.Effect<void> {
+  // cwd -> whether another run was requested while the current one runs.
+  const inFlight = new Map<string, boolean>();
+  const run = (cwd: string): Effect.Effect<void> =>
+    // `exit`: a failed refresh must not leave the folder marked as in flight forever.
+    Effect.exit(refresh(cwd)).pipe(
+      Effect.andThen(
+        Effect.suspend(() => {
+          if (!inFlight.get(cwd)) {
+            inFlight.delete(cwd);
+            return Effect.void;
+          }
+          inFlight.set(cwd, false);
+          return run(cwd);
+        }),
+      ),
+    );
+  return (cwd) =>
+    Effect.suspend(() => {
+      if (inFlight.has(cwd)) {
+        inFlight.set(cwd, true);
+        return Effect.void;
+      }
+      inFlight.set(cwd, false);
+      return Effect.asVoid(Effect.forkIn(run(cwd), scope));
+    });
+}
 
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
@@ -307,7 +349,13 @@ export const make = Effect.gen(function* () {
             }
             const children = await NodeFSP.readdir(directory, { withFileTypes: true });
             return children.flatMap((child): ProjectEntry[] => {
-              if (child.name === ".git" || (!child.isDirectory() && !child.isFile())) return [];
+              // Uploads in progress stream into hidden part files next to their target.
+              if (
+                child.name === ".git" ||
+                child.name.endsWith(WORKSPACE_UPLOAD_PART_SUFFIX) ||
+                (!child.isDirectory() && !child.isFile())
+              )
+                return [];
               return [
                 {
                   path: target.relativePath ? `${target.relativePath}/${child.name}` : child.name,
@@ -358,7 +406,16 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  return WorkspaceEntries.of({ browse, list, refresh, search, searchContents });
+  const refreshInBackground = coalesceRefreshes(refresh, yield* Effect.scope);
+
+  return WorkspaceEntries.of({
+    browse,
+    list,
+    refresh,
+    refreshInBackground,
+    search,
+    searchContents,
+  });
 });
 
 export const layer = Layer.effect(WorkspaceEntries, make).pipe(

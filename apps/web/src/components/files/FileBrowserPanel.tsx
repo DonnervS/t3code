@@ -23,10 +23,21 @@ import { readLocalApi } from "~/localApi";
 import { T3_PIERRE_ICONS } from "~/pierre-icons";
 import { PIERRE_TREE_UNSAFE_CSS, pierreTreeStyle } from "~/pierre-tree-theme";
 
+import {
+  collectDroppedEntries,
+  type DropEntryLike,
+} from "~/lib/workspaceUpload/collectDroppedEntries";
+import {
+  workspaceFilesChanged,
+  workspaceFilesKey,
+} from "~/lib/workspaceUpload/workspaceFilesChanged";
+
 import { createFileTreeDragMentionController } from "./fileTreeDragMention";
 import { areAllDirectoriesExpanded, setAllDirectoriesExpanded } from "./fileTreeExpansion";
+import { isExternalFileDrag, resolveDropTargetDirectory } from "./fileTreeDropTarget";
 import { buildFileTreePathUpdates } from "./fileTreePathReconciliation";
 import { useDirectoryEntries } from "./useDirectoryEntries";
+import { useWorkspaceUpload } from "./useWorkspaceUpload";
 import { useProjectPathSearch } from "~/state/queries";
 
 interface FileBrowserPanelProps {
@@ -371,19 +382,31 @@ export default function FileBrowserPanel({
     }
     search.setValue(value);
   };
-  const handleRefresh = () => {
+  const refreshTree = () => {
     refresh();
     if (query.trim()) pathSearch.refresh();
+  };
+  const handleRefresh = () => {
+    refreshTree();
     onRefreshSelectedFile?.();
   };
   useWorkspaceMutationRefresh({
     mutationId: workspaceMutationId,
-    refresh: () => {
-      refresh();
-      if (query.trim()) pathSearch.refresh();
-    },
+    refresh: refreshTree,
     resourceKey: `files:${environmentId}:${cwd}`,
   });
+  // Uploads re-list the folders on screen as files land; the runs outlive this panel.
+  const refreshTreeRef = useRef(refreshTree);
+  useEffect(() => {
+    refreshTreeRef.current = refreshTree;
+  });
+  useEffect(
+    () =>
+      workspaceFilesChanged.subscribe(workspaceFilesKey(environmentId, cwd), () =>
+        refreshTreeRef.current(),
+      ),
+    [cwd, environmentId],
+  );
 
   useEffect(() => {
     if (!ready) return;
@@ -480,6 +503,71 @@ export default function FileBrowserPanel({
   // The capture phase runs before the tree's own dragstart handler selects
   // the dragged row, so the drag flag is up before that selection emits.
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const workspaceUpload = useWorkspaceUpload(environmentId, cwd, projectName);
+  const workspaceUploadRef = useRef(workspaceUpload);
+  useEffect(() => {
+    workspaceUploadRef.current = workspaceUpload;
+  });
+  // Folder an OS file drag currently points at ("" = project root); null when no drag.
+  const [dropTargetDirectory, setDropTargetDirectory] = useState<string | null>(null);
+
+  // OS file drops upload into the folder under the pointer. Capture phase, so
+  // the tree's own row drag handling never sees external files; row drags
+  // (chat mentions) carry no "Files" type and pass through untouched.
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (panel === null) return;
+    const handleDragOver = (event: DragEvent) => {
+      if (!isExternalFileDrag(event.dataTransfer?.types)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = workspaceUploadRef.current.canUpload ? "copy" : "none";
+      }
+      setDropTargetDirectory(resolveDropTargetDirectory(event.composedPath()));
+    };
+    const handleDragLeave = (event: DragEvent) => {
+      if (event.relatedTarget instanceof Node && panel.contains(event.relatedTarget)) return;
+      setDropTargetDirectory(null);
+    };
+    const handleDrop = (event: DragEvent) => {
+      if (!isExternalFileDrag(event.dataTransfer?.types)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      setDropTargetDirectory(null);
+      const transfer = event.dataTransfer;
+      if (!transfer || !workspaceUploadRef.current.canUpload) return;
+      // Entries must be read while the drop event runs; the item list is cleared after it.
+      const entries = Array.from(transfer.items).flatMap((item) => {
+        const entry =
+          item.kind === "file" && typeof item.webkitGetAsEntry === "function"
+            ? item.webkitGetAsEntry()
+            : null;
+        return entry ? [entry as DropEntryLike] : [];
+      });
+      const fallbackFiles = Array.from(transfer.files);
+      const targetDirectory = resolveDropTargetDirectory(event.composedPath());
+      void collectDroppedEntries(entries, fallbackFiles).then(
+        (dropped) => workspaceUploadRef.current.upload(targetDirectory, dropped),
+        (error: unknown) =>
+          toastManager.add({
+            type: "error",
+            title: "Could not read the dropped files",
+            description: error instanceof Error ? error.message : "An error occurred.",
+          }),
+      );
+    };
+    panel.addEventListener("dragenter", handleDragOver, true);
+    panel.addEventListener("dragover", handleDragOver, true);
+    panel.addEventListener("dragleave", handleDragLeave, true);
+    panel.addEventListener("drop", handleDrop, true);
+    return () => {
+      panel.removeEventListener("dragenter", handleDragOver, true);
+      panel.removeEventListener("dragover", handleDragOver, true);
+      panel.removeEventListener("dragleave", handleDragLeave, true);
+      panel.removeEventListener("drop", handleDrop, true);
+    };
+  }, []);
   useEffect(() => {
     treeModelRef.current = model;
   }, [model]);
@@ -501,7 +589,7 @@ export default function FileBrowserPanel({
   return (
     <div
       ref={panelRef}
-      className="flex min-h-0 flex-1 flex-col bg-background"
+      className="relative flex min-h-0 flex-1 flex-col bg-background"
       data-file-browser-panel={`${environmentId}:${cwd}`}
     >
       <div
@@ -569,6 +657,21 @@ export default function FileBrowserPanel({
         className="min-h-0 flex-1 overflow-hidden"
         style={pierreTreeStyle(resolvedTheme)}
       />
+      {dropTargetDirectory !== null ? (
+        <div
+          role="status"
+          className="pointer-events-none absolute inset-x-2 bottom-2 z-10 rounded-md border border-primary/40 bg-background/95 px-3 py-2 text-xs shadow-sm"
+        >
+          {workspaceUpload.canUpload ? (
+            <>
+              Drop to upload to{" "}
+              <code>{dropTargetDirectory === "" ? projectName : `${dropTargetDirectory}/`}</code>
+            </>
+          ) : (
+            "This connection cannot write files."
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }
