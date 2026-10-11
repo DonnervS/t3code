@@ -337,6 +337,41 @@ const KEEP_BOTH_MAX_ATTEMPTS = 1000;
 const LINK_UNSUPPORTED_CODES = ["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV", "EISDIR"];
 // What renaming a file over a folder, folder symlink or junction fails with (Windows: EPERM).
 const RENAME_OVER_DIRECTORY_CODES = ["EPERM", "EISDIR", "EEXIST", "EACCES", "ENOTEMPTY"];
+// On Windows, antivirus scanners and indexers briefly hold new or replaced files open.
+const LOCKED_FILE_CODES = ["EPERM", "EBUSY", "EACCES"];
+// Five attempts, 750 ms of waiting in all.
+const LOCKED_FILE_RETRY_DELAYS_MS = [50, 100, 200, 400];
+
+/** File operations that place an upload; a test seam for failures that are hard to provoke. */
+export type PlaceOps = Pick<typeof NodeFSP, "link" | "open" | "rename" | "rm" | "unlink"> & {
+  readonly sleep?: (ms: number) => Promise<void>;
+};
+
+const sleepMs = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const isLockedFileError = (cause: unknown) =>
+  LOCKED_FILE_CODES.some((code) => isNodeError(cause, code));
+
+/** Runs `operation` again while the file is locked by another process, a few times at most. */
+async function retryWhileLocked<T>(
+  operation: () => Promise<T>,
+  sleep: (ms: number) => Promise<void> = sleepMs,
+): Promise<T> {
+  for (const delay of LOCKED_FILE_RETRY_DELAYS_MS) {
+    try {
+      return await operation();
+    } catch (cause) {
+      if (!isLockedFileError(cause)) throw cause;
+      await sleep(delay);
+    }
+  }
+  return operation();
+}
+
+/** Removes a part file, waiting out a scanner that still holds it. Never fails. */
+async function removePartFile(partPath: string, ops: PlaceOps = NodeFSP): Promise<void> {
+  await retryWhileLocked(() => ops.rm(partPath, { force: true }), ops.sleep).catch(() => undefined);
+}
 
 /** `report.pdf` -> `report (1).pdf`; `.env` -> `.env (1)`; `Makefile` -> `Makefile (1)`. */
 export function withCopySuffix(filePath: string, copy: number): string {
@@ -350,11 +385,10 @@ export function withCopySuffix(filePath: string, copy: number): string {
  * Moves the part file to `targetPath` only if that name is still free. A hard
  * link fails atomically with EEXIST, so a file an agent writes meanwhile wins.
  */
-// `ops` is a test seam for failures that are hard to provoke on a real filesystem.
 export async function placeExclusive(
   partPath: string,
   targetPath: string,
-  ops: Pick<typeof NodeFSP, "link" | "open" | "rename" | "rm" | "unlink"> = NodeFSP,
+  ops: PlaceOps = NodeFSP,
 ): Promise<boolean> {
   try {
     await ops.link(partPath, targetPath);
@@ -380,7 +414,7 @@ export async function placeExclusive(
     return true;
   }
   // The file is stored already; the caller removes the part file if this fails.
-  await ops.rm(partPath, { force: true }).catch(() => undefined);
+  await removePartFile(partPath, ops);
   return true;
 }
 
@@ -395,18 +429,21 @@ async function isDirectoryOrDirectoryLink(absolutePath: string): Promise<boolean
 
 export type PlaceUploadResult =
   | { readonly status: "stored"; readonly absolutePath: string }
-  | { readonly status: "conflict" };
+  | { readonly status: "conflict" }
+  /** Another process kept the file to replace locked. */
+  | { readonly status: "inUse" };
 
-export async function placeUploadedFile(
+async function replaceFile(
   partPath: string,
   targetPath: string,
-  mode: typeof WorkspaceUploadConflictMode.Type,
+  ops: PlaceOps,
 ): Promise<PlaceUploadResult> {
-  if (mode === "replace") {
-    if (await isDirectoryOrDirectoryLink(targetPath)) return { status: "conflict" };
+  if (await isDirectoryOrDirectoryLink(targetPath)) return { status: "conflict" };
+  for (let attempt = 0; ; attempt++) {
     try {
       // rename replaces a file (or a symlink itself, never its target) on every platform.
-      await NodeFSP.rename(partPath, targetPath);
+      await ops.rename(partPath, targetPath);
+      return { status: "stored", absolutePath: targetPath };
     } catch (cause) {
       // A folder may have taken the name since the check above.
       if (
@@ -415,14 +452,25 @@ export async function placeUploadedFile(
       ) {
         return { status: "conflict" };
       }
-      throw cause;
+      if (!isLockedFileError(cause)) throw cause;
+      const delay = LOCKED_FILE_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined) return { status: "inUse" };
+      await (ops.sleep ?? sleepMs)(delay);
     }
-    return { status: "stored", absolutePath: targetPath };
   }
+}
+
+export async function placeUploadedFile(
+  partPath: string,
+  targetPath: string,
+  mode: typeof WorkspaceUploadConflictMode.Type,
+  ops: PlaceOps = NodeFSP,
+): Promise<PlaceUploadResult> {
+  if (mode === "replace") return replaceFile(partPath, targetPath, ops);
   const attempts = mode === "keepBoth" ? KEEP_BOTH_MAX_ATTEMPTS : 1;
   for (let copy = 0; copy < attempts; copy++) {
     const candidate = copy === 0 ? targetPath : withCopySuffix(targetPath, copy);
-    if (await placeExclusive(partPath, candidate)) {
+    if (await placeExclusive(partPath, candidate, ops)) {
       return { status: "stored", absolutePath: candidate };
     }
   }
@@ -521,6 +569,13 @@ export const storeWorkspaceUpload = Effect.fn("WorkspaceUpload.store")(function*
         detail: "A file or folder with this name appeared while uploading.",
       } satisfies StoreWorkspaceUploadResult;
     }
+    if (placed.status === "inUse") {
+      return {
+        ok: false,
+        status: 423,
+        detail: "The file is in use on the host.",
+      } satisfies StoreWorkspaceUploadResult;
+    }
     yield* workspaceEntries.refresh(claims.cwd);
     return {
       ok: true,
@@ -538,8 +593,6 @@ export const storeWorkspaceUpload = Effect.fn("WorkspaceUpload.store")(function*
         } satisfies StoreWorkspaceUploadResult),
       ),
     ),
-    Effect.ensuring(
-      fileSystem.remove(partPath, { force: true }).pipe(Effect.orElseSucceed(() => undefined)),
-    ),
+    Effect.ensuring(Effect.promise(() => removePartFile(partPath))),
   );
 });

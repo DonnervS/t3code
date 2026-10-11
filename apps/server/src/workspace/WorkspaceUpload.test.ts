@@ -611,16 +611,120 @@ describe("placeExclusive fallback cleanup", () => {
     try {
       NodeFS.writeFileSync(NodePath.join(dir, "part"), "x");
       const target = NodePath.join(dir, "target.txt");
+      let removeAttempts = 0;
       await expect(
         placeExclusive(NodePath.join(dir, "part"), target, {
           ...NodeFSP,
-          rm: () => Promise.reject(nodeError("EBUSY")),
+          rm: () => {
+            removeAttempts += 1;
+            return Promise.reject(nodeError("EBUSY"));
+          },
+          sleep: async () => {},
         }),
       ).resolves.toBe(true);
       expect(NodeFS.readFileSync(target, "utf8")).toBe("x");
+      expect(removeAttempts).toBe(5);
     } finally {
       NodeFS.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("placing over a locked file", () => {
+  const nodeError = (code: string) => Object.assign(new Error(code), { code });
+  const withTempDir = async (run: (dir: string) => Promise<void>) => {
+    const dir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-locked-"));
+    try {
+      await run(dir);
+    } finally {
+      NodeFS.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  /** Fails the first `times` calls with `code`, then runs the real operation. */
+  const failingFirst = <A extends ReadonlyArray<unknown>, R>(
+    times: number,
+    code: string,
+    operation: (...args: A) => Promise<R>,
+  ) => {
+    const calls = { count: 0 };
+    const run = (...args: A) =>
+      ++calls.count <= times ? Promise.reject(nodeError(code)) : operation(...args);
+    return { calls, run };
+  };
+
+  it("retries a replace while another process holds the target", async () => {
+    await withTempDir(async (dir) => {
+      const part = NodePath.join(dir, "part");
+      const target = NodePath.join(dir, "target.txt");
+      NodeFS.writeFileSync(part, "new");
+      NodeFS.writeFileSync(target, "old");
+      const rename = failingFirst(2, "EBUSY", NodeFSP.rename);
+      const waits: number[] = [];
+      await expect(
+        placeUploadedFile(part, target, "replace", {
+          ...NodeFSP,
+          rename: rename.run,
+          sleep: async (ms) => {
+            waits.push(ms);
+          },
+        }),
+      ).resolves.toEqual({ status: "stored", absolutePath: target });
+      expect(rename.calls.count).toBe(3);
+      expect(waits.reduce((sum, ms) => sum + ms, 0)).toBeLessThan(2000);
+      expect(NodeFS.readFileSync(target, "utf8")).toBe("new");
+    });
+  });
+
+  it("reports a target that stays locked as in use, without touching it", async () => {
+    await withTempDir(async (dir) => {
+      const part = NodePath.join(dir, "part");
+      const target = NodePath.join(dir, "target.txt");
+      NodeFS.writeFileSync(part, "new");
+      NodeFS.writeFileSync(target, "old");
+      for (const code of ["EPERM", "EBUSY", "EACCES"]) {
+        const rename = failingFirst(Number.POSITIVE_INFINITY, code, NodeFSP.rename);
+        await expect(
+          placeUploadedFile(part, target, "replace", {
+            ...NodeFSP,
+            rename: rename.run,
+            sleep: async () => {},
+          }),
+        ).resolves.toEqual({ status: "inUse" });
+        expect(rename.calls.count).toBe(5);
+      }
+      expect(NodeFS.readFileSync(target, "utf8")).toBe("old");
+    });
+  });
+
+  it("does not retry other rename failures", async () => {
+    await withTempDir(async (dir) => {
+      const part = NodePath.join(dir, "part");
+      NodeFS.writeFileSync(part, "new");
+      const rename = failingFirst(Number.POSITIVE_INFINITY, "ENOSPC", NodeFSP.rename);
+      await expect(
+        placeUploadedFile(part, NodePath.join(dir, "t.txt"), "replace", {
+          ...NodeFSP,
+          rename: rename.run,
+          sleep: async () => {},
+        }),
+      ).rejects.toMatchObject({ code: "ENOSPC" });
+      expect(rename.calls.count).toBe(1);
+    });
+  });
+
+  it("removes the part file once a scanner lets go of it", async () => {
+    await withTempDir(async (dir) => {
+      const part = NodePath.join(dir, "part");
+      const target = NodePath.join(dir, "target.txt");
+      NodeFS.writeFileSync(part, "new");
+      const rm = failingFirst(2, "EPERM", NodeFSP.rm);
+      await expect(
+        placeUploadedFile(part, target, "fail", { ...NodeFSP, rm: rm.run, sleep: async () => {} }),
+      ).resolves.toEqual({ status: "stored", absolutePath: target });
+      expect(rm.calls.count).toBe(3);
+      expect(NodeFS.existsSync(part)).toBe(false);
+      expect(NodeFS.readFileSync(target, "utf8")).toBe("new");
+    });
   });
 });
 
