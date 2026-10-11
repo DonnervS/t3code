@@ -74,19 +74,26 @@ export type UploadTarget =
 
 const rejectTarget = (reason: string): UploadTarget => ({ ok: false, reason });
 
+/** Case-insensitive: the project may live on a case-insensitive filesystem. */
+function hasGitSegment(segments: ReadonlyArray<string>): boolean {
+  return segments.some((segment) => segment.toLowerCase() === ".git");
+}
+
 /**
  * The nearest existing ancestor of `absolutePath` must resolve inside the real
- * workspace root, so a symlinked folder cannot carry an upload out of the project.
+ * workspace root, and not into a `.git` folder reached through a symlink.
  */
 async function isInsideRealRoot(realRoot: string, absolutePath: string): Promise<boolean> {
   let candidate = NodePath.dirname(absolutePath);
   for (;;) {
     try {
       const relative = NodePath.relative(realRoot, await NodeFSP.realpath(candidate));
-      return !(
-        relative === ".." ||
-        relative.startsWith(`..${NodePath.sep}`) ||
-        NodePath.isAbsolute(relative)
+      return (
+        !(
+          relative === ".." ||
+          relative.startsWith(`..${NodePath.sep}`) ||
+          NodePath.isAbsolute(relative)
+        ) && !hasGitSegment(relative.split(NodePath.sep))
       );
     } catch (cause) {
       const parent = NodePath.dirname(candidate);
@@ -106,7 +113,7 @@ export const resolveUploadTarget = Effect.fn("WorkspaceUpload.resolveTarget")(fu
     .resolveRelativePathWithinRoot({ workspaceRoot: cwd, relativePath })
     .pipe(Effect.option);
   if (Option.isNone(resolved)) return rejectTarget("Outside the project folder.");
-  if (resolved.value.relativePath.split("/").includes(".git")) {
+  if (hasGitSegment(resolved.value.relativePath.split("/"))) {
     return rejectTarget("Uploads into .git are not allowed.");
   }
   if (NodePath.basename(resolved.value.absolutePath).endsWith(WORKSPACE_UPLOAD_PART_SUFFIX)) {
@@ -144,15 +151,21 @@ async function makeDirectory(absolutePath: string): Promise<string | null> {
 
 /** Uploads that died with the server leave part files; clear old ones in folders we touch. */
 async function sweepStaleParts(directory: string, nowMs: number): Promise<void> {
+  let entries;
   try {
-    for (const entry of await NodeFSP.readdir(directory, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(WORKSPACE_UPLOAD_PART_SUFFIX)) continue;
-      const partPath = NodePath.join(directory, entry.name);
+    entries = await NodeFSP.readdir(directory, { withFileTypes: true });
+  } catch {
+    return; // Best effort: a failed sweep must not block the upload.
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(WORKSPACE_UPLOAD_PART_SUFFIX)) continue;
+    const partPath = NodePath.join(directory, entry.name);
+    try {
       const { mtimeMs } = await NodeFSP.stat(partPath);
       if (nowMs - mtimeMs >= STALE_PART_AGE_MS) await NodeFSP.rm(partPath, { force: true });
+    } catch {
+      // One entry failing (e.g. removed concurrently) must not skip the rest.
     }
-  } catch {
-    // Best effort: a failed sweep must not block the upload.
   }
 }
 

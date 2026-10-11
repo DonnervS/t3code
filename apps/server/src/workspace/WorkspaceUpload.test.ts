@@ -207,4 +207,56 @@ it.layer(layerTest)("WorkspaceUpload.prepare", (it) => {
       expect(NodeFS.existsSync(stale)).toBe(false);
     }),
   );
+
+  it.effect("rejects .git segments regardless of letter case, for files and folders", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const result = yield* prepareWorkspaceUpload({
+        cwd,
+        directories: [".git/hooks", ".GIT/hooks"],
+        files: [
+          { relativePath: ".GIT/config", sizeBytes: 1, onConflict: "fail" },
+          { relativePath: "sub/.Git/x", sizeBytes: 1, onConflict: "fail" },
+        ],
+      });
+      expect(result.files.every((file) => file.status === "rejected")).toBe(true);
+      expect(result.rejectedDirectories).toHaveLength(2);
+      expect(NodeFS.readdirSync(cwd)).toEqual([]);
+    }),
+  );
+
+  it.effect.skipIf(!symlinksSupported)("rejects targets reached through a symlink to .git", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      NodeFS.mkdirSync(NodePath.join(cwd, ".git"));
+      NodeFS.symlinkSync(NodePath.join(cwd, ".git"), NodePath.join(cwd, "g"), "dir");
+
+      const result = yield* prepareWorkspaceUpload({
+        cwd,
+        directories: [],
+        files: [{ relativePath: "g/hooks/x", sizeBytes: 1, onConflict: "fail" }],
+      });
+      expect(result.files[0]).toMatchObject({ status: "rejected" });
+      expect(NodeFS.readdirSync(NodePath.join(cwd, ".git"))).toEqual([]);
+    }),
+  );
+
+  it.effect("keeps fresh part files while removing old ones", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const stale = NodePath.join(cwd, "docs", ".old.abc.t3upload.part");
+      const fresh = NodePath.join(cwd, "docs", ".new.abc.t3upload.part");
+      writeFile(cwd, "docs/.old.abc.t3upload.part", "partial");
+      writeFile(cwd, "docs/.new.abc.t3upload.part", "partial");
+      NodeFS.utimesSync(stale, 0, 0);
+
+      yield* prepareWorkspaceUpload({
+        cwd,
+        directories: [],
+        files: [{ relativePath: "docs/new.pdf", sizeBytes: 1, onConflict: "fail" }],
+      });
+      expect(NodeFS.existsSync(stale)).toBe(false);
+      expect(NodeFS.existsSync(fresh)).toBe(true);
+    }),
+  );
 });
