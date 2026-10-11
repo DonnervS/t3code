@@ -233,6 +233,11 @@ import {
   ProjectWriteFileResult,
 } from "./project.ts";
 import {
+  ProjectPrepareUploadError,
+  ProjectPrepareUploadInput,
+  ProjectPrepareUploadResult,
+} from "./workspaceUpload.ts";
+import {
   TerminalAttachInput,
   TerminalObserveInput,
   TerminalAttachStreamEvent,
@@ -373,6 +378,7 @@ export const WS_METHODS = {
   projectsSearchContents: "projects.searchContents",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectsPrepareUpload: "projects.prepareUpload",
   projectsMutate: "projects.mutate",
   projectsEnsureScratch: "projects.ensureScratch",
   projectsCreateNew: "projects.createNew",
@@ -1211,6 +1217,13 @@ const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
 });
 
+// Signs one upload URL per dropped file; the bytes go to WORKSPACE_UPLOAD_ROUTE_PREFIX over HTTP.
+const WsProjectsPrepareUploadRpc = Rpc.make(WS_METHODS.projectsPrepareUpload, {
+  payload: ProjectPrepareUploadInput,
+  success: ProjectPrepareUploadResult,
+  error: Schema.Union([ProjectPrepareUploadError, EnvironmentAuthorizationError]),
+});
+
 const WsProjectsMutateRpc = Rpc.make(WS_METHODS.projectsMutate, {
   payload: ProjectMutation,
   success: Project,
@@ -1944,6 +1957,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsEnsureScratchRpc,
   WsProjectsCreateNewRpc,
   WsProjectsWriteFileRpc,
+  WsProjectsPrepareUploadRpc,
   WsProjectsMutateRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
