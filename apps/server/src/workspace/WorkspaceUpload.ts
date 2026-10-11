@@ -576,7 +576,8 @@ export const storeWorkspaceUpload = Effect.fn("WorkspaceUpload.store")(function*
         detail: "The file is in use on the host.",
       } satisfies StoreWorkspaceUploadResult;
     }
-    yield* workspaceEntries.refresh(claims.cwd);
+    // Off the response path: one drop stores many files, each would rescan the index.
+    yield* workspaceEntries.refreshInBackground(claims.cwd);
     return {
       ok: true,
       relativePath: toPosixPath(NodePath.relative(claims.cwd, placed.absolutePath)),

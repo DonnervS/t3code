@@ -3,11 +3,13 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { FileFinder } from "@ff-labs/fff-node";
 import { it, afterEach, describe, expect } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import { vi } from "vite-plus/test";
 
 import * as ServerConfig from "../config.ts";
@@ -845,4 +847,69 @@ it.layer(layerTest, { excludeTestServices: true })("WorkspaceEntries", (it) => {
       }),
     );
   });
+});
+
+describe("coalesceRefreshes", () => {
+  it.effect("runs one refresh per folder at a time, plus one for everything asked meanwhile", () =>
+    Effect.gen(function* () {
+      const started = yield* Queue.unbounded<string>();
+      const gates = new Map<string, Deferred.Deferred<void>>();
+      const runs = new Map<string, number>();
+      const refresh = (cwd: string) =>
+        Effect.gen(function* () {
+          const run = `${cwd}#${(runs.get(cwd) ?? 0) + 1}`;
+          runs.set(cwd, (runs.get(cwd) ?? 0) + 1);
+          const gate = yield* Deferred.make<void>();
+          gates.set(run, gate);
+          yield* Queue.offer(started, run);
+          yield* Deferred.await(gate);
+        });
+      const open = (run: string) => Deferred.succeed(gates.get(run)!, undefined);
+      const request = WorkspaceEntries.coalesceRefreshes(refresh, yield* Effect.scope);
+
+      // Ten files of one drop finish while the first refresh runs.
+      for (let index = 0; index < 10; index++) yield* request("/a");
+      yield* request("/b");
+      expect([yield* Queue.take(started), yield* Queue.take(started)].toSorted()).toEqual([
+        "/a#1",
+        "/b#1",
+      ]);
+      expect(yield* Queue.size(started)).toBe(0);
+
+      yield* open("/a#1");
+      expect(yield* Queue.take(started)).toBe("/a#2");
+      for (let index = 0; index < 5; index++) yield* request("/a");
+      expect(yield* Queue.size(started)).toBe(0);
+
+      yield* open("/a#2");
+      expect(yield* Queue.take(started)).toBe("/a#3");
+      yield* open("/a#3");
+      yield* open("/b#1");
+      expect(runs).toEqual(
+        new Map([
+          ["/a", 3],
+          ["/b", 1],
+        ]),
+      );
+    }),
+  );
+
+  it.effect("keeps refreshing after a refresh fails", () =>
+    Effect.gen(function* () {
+      const started = yield* Queue.unbounded<number>();
+      let calls = 0;
+      const refresh = (_cwd: string) =>
+        Effect.gen(function* () {
+          calls += 1;
+          yield* Queue.offer(started, calls);
+          if (calls === 1) return yield* Effect.die(new Error("index scan crashed"));
+        });
+      const request = WorkspaceEntries.coalesceRefreshes(refresh, yield* Effect.scope);
+
+      yield* request("/a");
+      expect(yield* Queue.take(started)).toBe(1);
+      yield* request("/a");
+      expect(yield* Queue.take(started)).toBe(2);
+    }),
+  );
 });

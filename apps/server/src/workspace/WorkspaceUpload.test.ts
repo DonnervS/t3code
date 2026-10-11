@@ -538,6 +538,27 @@ it.layer(layerTest)("WorkspaceUpload.store", (it) => {
     }),
   );
 
+  it.effect("answers without waiting for the search index, refreshing it once per batch", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      let refreshes = 0;
+      // An index rescan that never finishes must not hold up any response.
+      const refreshInBackground = WorkspaceEntries.coalesceRefreshes(
+        () => Effect.sync(() => (refreshes += 1)).pipe(Effect.andThen(Effect.never)),
+        yield* Effect.scope,
+      );
+      for (const name of ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]) {
+        const claims = yield* prepareOne(cwd, name, "x", "fail");
+        expect(
+          yield* storeWorkspaceUpload(claims, bytes("x")).pipe(
+            Effect.provide(Layer.mock(WorkspaceEntries.WorkspaceEntries)({ refreshInBackground })),
+          ),
+        ).toEqual({ ok: true, relativePath: name });
+      }
+      expect(refreshes).toBeLessThanOrEqual(1);
+    }),
+  );
+
   it.effect("rejects with 403 when the path stopped being allowed after signing", () =>
     Effect.gen(function* () {
       const cwd = yield* makeTempDir;
