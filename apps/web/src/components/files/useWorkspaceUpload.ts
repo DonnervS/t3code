@@ -2,22 +2,20 @@ import { AuthFilesystemWriteScope, type EnvironmentId } from "@t3tools/contracts
 import { resolveAssetUrl } from "@t3tools/client-runtime/state/assets";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import { runAtomCommand, squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback } from "react";
 
 import { toastManager } from "~/components/ui/toast";
 import type { DroppedEntries } from "~/lib/workspaceUpload/collectDroppedEntries";
+import { workspaceUploadConflictQueue } from "~/lib/workspaceUpload/conflictQueue";
 import { sendUploadBytes } from "~/lib/workspaceUpload/sendUploadBytes";
 import {
   startWorkspaceUpload,
-  type UploadConflictChoice,
   type WorkspaceUploadProgress,
   type WorkspaceUploadSummary,
 } from "~/lib/workspaceUpload/workspaceUploadRun";
 import { appAtomRegistry } from "~/rpc/atomRegistry";
 import { projectEnvironment } from "~/state/projects";
 import { readPreparedConnection, useEnvironmentScope } from "~/state/session";
-
-import type { ConflictRequest } from "./WorkspaceUploadConflictDialog";
 
 const PROGRESS_TOAST_INTERVAL_MS = 250;
 const MAX_LISTED_FAILURES = 5;
@@ -59,106 +57,85 @@ function showSummary(summary: WorkspaceUploadSummary, targetLabel: string) {
   });
 }
 
-/** Uploads dropped files into the project folder, with progress toast and conflict dialog state. */
+/**
+ * Starts an upload owned by the app, not by the panel that received the drop:
+ * navigating away never stops it. Only the toast's Cancel button does.
+ */
+function startUpload(
+  environmentId: EnvironmentId,
+  cwd: string,
+  projectName: string,
+  targetDirectory: string,
+  entries: DroppedEntries,
+) {
+  if (entries.files.length === 0 && entries.directories.length === 0) return;
+  const targetLabel = targetDirectory === "" ? projectName : `${targetDirectory}/`;
+  let lastToastUpdate = 0;
+  let cancelRun = () => {};
+  let cancelled = false;
+  const openQuestions = new Set<() => void>();
+  const cancel = () => {
+    cancelled = true;
+    cancelRun();
+    for (const cancelQuestion of openQuestions) cancelQuestion();
+  };
+  const toastId = toastManager.add({
+    type: "loading",
+    title: `Uploading to ${targetLabel}`,
+    description: "Preparing…",
+    timeout: 0,
+    actionProps: { children: "Cancel", onClick: cancel },
+    data: { hideCopyButton: true },
+  });
+  const run = startWorkspaceUpload({
+    cwd,
+    targetDirectory,
+    entries,
+    onProgress: (progress) => {
+      const now = Date.now();
+      if (now - lastToastUpdate < PROGRESS_TOAST_INTERVAL_MS) return;
+      lastToastUpdate = now;
+      toastManager.update(toastId, { description: progressDescription(progress) });
+    },
+    deps: {
+      prepare: async (input) => {
+        const result = await runAtomCommand(
+          appAtomRegistry,
+          projectEnvironment.prepareUpload,
+          { environmentId, input },
+          { reportFailure: false },
+        );
+        if (result._tag === "Success") return result.value;
+        const error = squashAtomCommandFailure(result);
+        throw error instanceof Error ? error : new Error("Failed to prepare the upload.");
+      },
+      resolveUrl: (relativeUrl) => {
+        const connection = readPreparedConnection(environmentId);
+        return connection ? resolveAssetUrl(connection.httpBaseUrl, relativeUrl) : null;
+      },
+      send: sendUploadBytes,
+      resolveConflicts: (conflicts) => {
+        if (cancelled) return Promise.resolve(new Map());
+        const question = workspaceUploadConflictQueue.ask(conflicts);
+        openQuestions.add(question.cancel);
+        return question.promise.finally(() => openQuestions.delete(question.cancel));
+      },
+    },
+  });
+  cancelRun = run.cancel;
+  void run.done.then((summary) => {
+    toastManager.close(toastId);
+    showSummary(summary, targetLabel);
+  });
+}
+
+/** Lets the file tree start uploads; the runs themselves outlive the panel. */
 export function useWorkspaceUpload(environmentId: EnvironmentId, cwd: string, projectName: string) {
   const canUpload = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
-  const [conflictRequest, setConflictRequest] = useState<ConflictRequest | null>(null);
-  const requestIdRef = useRef(0);
-  // One dialog at a time: concurrent uploads queue their questions behind this.
-  const dialogQueueRef = useRef<Promise<unknown>>(Promise.resolve());
-  // Cancels of runs still in flight, so unmounting never leaves one waiting on the dialog.
-  const activeCancelsRef = useRef(new Set<() => void>());
-
-  useEffect(() => {
-    const activeCancels = activeCancelsRef.current;
-    return () => {
-      for (const cancel of activeCancels) cancel();
-    };
-  }, []);
-
   const upload = useCallback(
-    (targetDirectory: string, entries: DroppedEntries) => {
-      if (entries.files.length === 0 && entries.directories.length === 0) return;
-      const targetLabel = targetDirectory === "" ? projectName : `${targetDirectory}/`;
-      let lastToastUpdate = 0;
-      let cancelRun = () => {};
-      // Settles this run's open conflict question, if any, as "skip everything".
-      let settlePendingConflicts: (() => void) | null = null;
-      let cancelled = false;
-      const cancel = () => {
-        cancelled = true;
-        cancelRun();
-        settlePendingConflicts?.();
-      };
-      const toastId = toastManager.add({
-        type: "loading",
-        title: `Uploading to ${targetLabel}`,
-        description: "Preparing…",
-        timeout: 0,
-        actionProps: { children: "Cancel", onClick: cancel },
-        data: { hideCopyButton: true },
-      });
-      const run = startWorkspaceUpload({
-        cwd,
-        targetDirectory,
-        entries,
-        onProgress: (progress) => {
-          const now = Date.now();
-          if (now - lastToastUpdate < PROGRESS_TOAST_INTERVAL_MS) return;
-          lastToastUpdate = now;
-          toastManager.update(toastId, { description: progressDescription(progress) });
-        },
-        deps: {
-          prepare: async (input) => {
-            const result = await runAtomCommand(
-              appAtomRegistry,
-              projectEnvironment.prepareUpload,
-              { environmentId, input },
-              { reportFailure: false },
-            );
-            if (result._tag === "Success") return result.value;
-            const error = squashAtomCommandFailure(result);
-            throw error instanceof Error ? error : new Error("Failed to prepare the upload.");
-          },
-          resolveUrl: (relativeUrl) => {
-            const connection = readPreparedConnection(environmentId);
-            return connection ? resolveAssetUrl(connection.httpBaseUrl, relativeUrl) : null;
-          },
-          send: sendUploadBytes,
-          resolveConflicts: (conflicts) => {
-            const asked = dialogQueueRef.current.then(
-              () =>
-                new Promise<ReadonlyMap<string, UploadConflictChoice>>((resolve) => {
-                  // Cancelled while queued behind another dialog: never show this one.
-                  if (cancelled) return resolve(new Map());
-                  let settled = false;
-                  const settle = (choices: ReadonlyMap<string, UploadConflictChoice>) => {
-                    if (settled) return;
-                    settled = true;
-                    settlePendingConflicts = null;
-                    setConflictRequest(null);
-                    resolve(choices);
-                  };
-                  settlePendingConflicts = () => settle(new Map());
-                  requestIdRef.current += 1;
-                  setConflictRequest({ id: requestIdRef.current, conflicts, resolve: settle });
-                }),
-            );
-            dialogQueueRef.current = asked.catch(() => {});
-            return asked;
-          },
-        },
-      });
-      cancelRun = run.cancel;
-      activeCancelsRef.current.add(cancel);
-      void run.done.then((summary) => {
-        activeCancelsRef.current.delete(cancel);
-        toastManager.close(toastId);
-        showSummary(summary, targetLabel);
-      });
-    },
+    (targetDirectory: string, entries: DroppedEntries) =>
+      startUpload(environmentId, cwd, projectName, targetDirectory, entries),
     [cwd, environmentId, projectName],
   );
-
-  return { canUpload, upload, conflictRequest };
+  return { canUpload, upload };
 }

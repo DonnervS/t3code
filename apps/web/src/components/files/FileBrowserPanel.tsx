@@ -34,7 +34,6 @@ import { isExternalFileDrag, resolveDropTargetDirectory } from "./fileTreeDropTa
 import { buildFileTreePathUpdates } from "./fileTreePathReconciliation";
 import { useDirectoryEntries } from "./useDirectoryEntries";
 import { useWorkspaceUpload } from "./useWorkspaceUpload";
-import { WorkspaceUploadConflictDialog } from "./WorkspaceUploadConflictDialog";
 import { useProjectPathSearch } from "~/state/queries";
 
 interface FileBrowserPanelProps {
@@ -524,7 +523,10 @@ export default function FileBrowserPanel({
       if (!transfer || !workspaceUploadRef.current.canUpload) return;
       // Entries must be read while the drop event runs; the item list is cleared after it.
       const entries = Array.from(transfer.items).flatMap((item) => {
-        const entry = item.kind === "file" ? item.webkitGetAsEntry() : null;
+        const entry =
+          item.kind === "file" && typeof item.webkitGetAsEntry === "function"
+            ? item.webkitGetAsEntry()
+            : null;
         return entry ? [entry as DropEntryLike] : [];
       });
       const fallbackFiles = Array.from(transfer.files);
@@ -653,12 +655,6 @@ export default function FileBrowserPanel({
             "This connection cannot write files."
           )}
         </div>
-      ) : null}
-      {workspaceUpload.conflictRequest ? (
-        <WorkspaceUploadConflictDialog
-          key={workspaceUpload.conflictRequest.id}
-          request={workspaceUpload.conflictRequest}
-        />
       ) : null}
     </div>
   );

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useRef, useState, useSyncExternalStore } from "react";
 
 import {
   AlertDialog,
@@ -10,19 +10,14 @@ import {
 } from "~/components/ui/alert-dialog";
 import { Button } from "~/components/ui/button";
 import { Checkbox } from "~/components/ui/checkbox";
-import type {
-  UploadConflict,
-  UploadConflictChoice,
-} from "~/lib/workspaceUpload/workspaceUploadRun";
-
-export interface ConflictRequest {
-  readonly id: number;
-  readonly conflicts: ReadonlyArray<UploadConflict>;
-  readonly resolve: (choices: ReadonlyMap<string, UploadConflictChoice>) => void;
-}
+import {
+  workspaceUploadConflictQueue,
+  type ConflictRequest,
+} from "~/lib/workspaceUpload/conflictQueue";
+import type { UploadConflictChoice } from "~/lib/workspaceUpload/workspaceUploadRun";
 
 /** Walks through name conflicts one at a time; mount with `key={request.id}`. */
-export function WorkspaceUploadConflictDialog({ request }: { request: ConflictRequest }) {
+function WorkspaceUploadConflictDialog({ request }: { request: ConflictRequest }) {
   const [index, setIndex] = useState(0);
   const [applyToAll, setApplyToAll] = useState(false);
   const choices = useRef(new Map<string, UploadConflictChoice>());
@@ -96,4 +91,14 @@ export function WorkspaceUploadConflictDialog({ request }: { request: ConflictRe
       </AlertDialogPopup>
     </AlertDialog>
   );
+}
+
+/** Mounted once at app level; answers the questions of every running upload. */
+export function WorkspaceUploadConflictDialogHost() {
+  const request = useSyncExternalStore(
+    workspaceUploadConflictQueue.subscribe,
+    workspaceUploadConflictQueue.getSnapshot,
+    () => null,
+  );
+  return request ? <WorkspaceUploadConflictDialog key={request.id} request={request} /> : null;
 }
