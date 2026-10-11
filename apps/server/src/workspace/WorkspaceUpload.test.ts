@@ -4,10 +4,7 @@ import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import {
-  WORKSPACE_UPLOAD_MAX_FILE_BYTES,
-  WORKSPACE_UPLOAD_ROUTE_PREFIX,
-} from "@t3tools/contracts";
+import { WORKSPACE_UPLOAD_MAX_FILE_BYTES, WORKSPACE_UPLOAD_ROUTE_PREFIX } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -97,28 +94,30 @@ it.layer(layerTest)("WorkspaceUpload.prepare", (it) => {
     }),
   );
 
-  it.effect("rejects paths outside the project, inside .git, reserved names and oversized files", () =>
-    Effect.gen(function* () {
-      const cwd = yield* makeTempDir;
-      const result = yield* prepareWorkspaceUpload({
-        cwd,
-        directories: [],
-        files: [
-          { relativePath: "../escape.txt", sizeBytes: 1, onConflict: "fail" },
-          { relativePath: NodePath.join(cwd, "absolute.txt"), sizeBytes: 1, onConflict: "fail" },
-          { relativePath: ".git/config", sizeBytes: 1, onConflict: "fail" },
-          { relativePath: "sub/.git/hooks/x", sizeBytes: 1, onConflict: "fail" },
-          { relativePath: "x.t3upload.part", sizeBytes: 1, onConflict: "fail" },
-          {
-            relativePath: "huge.bin",
-            sizeBytes: WORKSPACE_UPLOAD_MAX_FILE_BYTES + 1,
-            onConflict: "fail",
-          },
-        ],
-      });
-      expect(result.files.every((file) => file.status === "rejected")).toBe(true);
-      expect(NodeFS.existsSync(NodePath.join(cwd, ".git"))).toBe(false);
-    }),
+  it.effect(
+    "rejects paths outside the project, inside .git, reserved names and oversized files",
+    () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTempDir;
+        const result = yield* prepareWorkspaceUpload({
+          cwd,
+          directories: [],
+          files: [
+            { relativePath: "../escape.txt", sizeBytes: 1, onConflict: "fail" },
+            { relativePath: NodePath.join(cwd, "absolute.txt"), sizeBytes: 1, onConflict: "fail" },
+            { relativePath: ".git/config", sizeBytes: 1, onConflict: "fail" },
+            { relativePath: "sub/.git/hooks/x", sizeBytes: 1, onConflict: "fail" },
+            { relativePath: "x.t3upload.part", sizeBytes: 1, onConflict: "fail" },
+            {
+              relativePath: "huge.bin",
+              sizeBytes: WORKSPACE_UPLOAD_MAX_FILE_BYTES + 1,
+              onConflict: "fail",
+            },
+          ],
+        });
+        expect(result.files.every((file) => file.status === "rejected")).toBe(true);
+        expect(NodeFS.existsSync(NodePath.join(cwd, ".git"))).toBe(false);
+      }),
   );
 
   it.effect.skipIf(!symlinksSupported)(

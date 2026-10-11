@@ -181,8 +181,7 @@ export const prepareWorkspaceUpload = Effect.fn("WorkspaceUpload.prepare")(funct
   const nowMs = yield* Clock.currentTimeMillis;
   const expiresAt = nowMs + WORKSPACE_UPLOAD_URL_TTL_MS;
 
-  const rejectedDirectories: Array<ProjectPrepareUploadResult["rejectedDirectories"][number]> =
-    [];
+  const rejectedDirectories: Array<ProjectPrepareUploadResult["rejectedDirectories"][number]> = [];
   for (const relativePath of input.directories) {
     const target = yield* resolveUploadTarget(realRoot, input.cwd, relativePath);
     const reason = target.ok
