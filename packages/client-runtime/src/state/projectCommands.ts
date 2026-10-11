@@ -164,5 +164,10 @@ export function createProjectEnvironmentAtoms<R, E>(
           JSON.stringify([environmentId, input.cwd, input.relativePath]),
       },
     }),
+    // Signs upload URLs for files dropped on the file tree; bytes go over HTTP.
+    prepareUpload: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:projects:prepare-upload",
+      tag: WS_METHODS.projectsPrepareUpload,
+    }),
   };
 }
