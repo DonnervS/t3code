@@ -12,6 +12,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
@@ -21,6 +22,7 @@ import * as WorkspaceEntries from "./WorkspaceEntries.ts";
 import * as WorkspacePaths from "./WorkspacePaths.ts";
 import {
   describeStoreFailure,
+  isValidHostFileName,
   placeExclusive,
   placeUploadedFile,
   prepareWorkspaceUpload,
@@ -236,6 +238,36 @@ it.layer(layerTest)("WorkspaceUpload.prepare", (it) => {
     }),
   );
 
+  it.effect("rejects names a Windows host cannot store, for files and folders", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      const result = yield* prepareWorkspaceUpload({
+        cwd,
+        directories: ["Music/AC:DC", "ok/fine"],
+        files: [
+          { relativePath: "AC:DC.mp3", sizeBytes: 1, onConflict: "fail" },
+          { relativePath: "CON/readme.txt", sizeBytes: 1, onConflict: "fail" },
+          { relativePath: "notes.", sizeBytes: 1, onConflict: "fail" },
+          { relativePath: "fine.txt", sizeBytes: 1, onConflict: "fail" },
+        ],
+      }).pipe(Effect.provideService(HostProcess.Platform, "win32"));
+
+      expect(result.files.map((file) => file.status)).toEqual([
+        "rejected",
+        "rejected",
+        "rejected",
+        "ready",
+      ]);
+      expect(result.files[0]).toMatchObject({
+        reason: "Not a valid file name on the host (Windows).",
+      });
+      expect(result.rejectedDirectories).toEqual([
+        { relativePath: "Music/AC:DC", reason: "Not a valid file name on the host (Windows)." },
+      ]);
+      expect(NodeFS.existsSync(NodePath.join(cwd, "CON"))).toBe(false);
+    }),
+  );
+
   it.effect.skipIf(!symlinksSupported)("rejects targets reached through a symlink to .git", () =>
     Effect.gen(function* () {
       const cwd = yield* makeTempDir;
@@ -270,6 +302,54 @@ it.layer(layerTest)("WorkspaceUpload.prepare", (it) => {
       expect(NodeFS.existsSync(fresh)).toBe(true);
     }),
   );
+});
+
+describe("isValidHostFileName", () => {
+  it("rejects what Windows cannot store", () => {
+    for (const name of [
+      "AC:DC.mp3",
+      "a<b",
+      "a>b",
+      'say "hi"',
+      "a|b",
+      "why?",
+      "star*",
+      "back\\slash",
+      "tab\there",
+      "nul\u0000byte",
+      "trailing.",
+      "trailing ",
+      "CON",
+      "con.txt",
+      "Nul.tar.gz",
+      "prn",
+      "AUX.md",
+      "COM1",
+      "lpt9.log",
+      "COM¹",
+    ]) {
+      expect(isValidHostFileName(name, "win32"), name).toBe(false);
+    }
+  });
+
+  it("accepts ordinary and near-reserved names on Windows", () => {
+    for (const name of [
+      " leading space",
+      "report.pdf",
+      ".env",
+      "console.log",
+      "COM10",
+      "nul-ish",
+      "a.b.c",
+    ]) {
+      expect(isValidHostFileName(name, "win32"), name).toBe(true);
+    }
+  });
+
+  it("does not apply Windows rules on other hosts", () => {
+    expect(isValidHostFileName("AC:DC.mp3", "darwin")).toBe(true);
+    expect(isValidHostFileName("CON", "linux")).toBe(true);
+  });
 });
 
 describe("withCopySuffix", () => {

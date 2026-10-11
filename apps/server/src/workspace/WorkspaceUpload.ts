@@ -22,6 +22,7 @@ import {
   WORKSPACE_UPLOAD_URL_TTL_MS,
   WorkspaceUploadConflictMode,
 } from "@t3tools/contracts";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -82,6 +83,26 @@ function hasGitSegment(segments: ReadonlyArray<string>): boolean {
   return segments.some((segment) => segment.toLowerCase() === ".git");
 }
 
+// Device names, with or without an extension ("nul.txt" is the NUL device too).
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³]) *(\..*)?$/i;
+const WINDOWS_INVALID_CHARACTER = /[<>:"|?*\\]/;
+
+/**
+ * Whether one path segment can be created as a file or folder name on `platform`.
+ * Names from a Mac ("AC:DC.mp3") are often invalid on Windows; rejecting them at prepare
+ * beats failing with a generic error after the whole file was sent.
+ */
+export function isValidHostFileName(segment: string, platform: NodeJS.Platform): boolean {
+  if (platform !== "win32") return true;
+  return !(
+    WINDOWS_INVALID_CHARACTER.test(segment) ||
+    [...segment].some((character) => character.charCodeAt(0) < 32) ||
+    segment.endsWith(".") ||
+    segment.endsWith(" ") ||
+    WINDOWS_RESERVED_NAME.test(segment)
+  );
+}
+
 /**
  * The nearest existing ancestor of `absolutePath` must resolve inside the real
  * workspace root, and not into a `.git` folder reached through a symlink.
@@ -137,6 +158,12 @@ export const resolveUploadTarget = Effect.fn("WorkspaceUpload.resolveTarget")(fu
   if (resolved === null) return rejectTarget("Outside the project folder.");
   if (hasGitSegment(resolved.relativePath.split("/"))) {
     return rejectTarget("Uploads into .git are not allowed.");
+  }
+  // The input's own segments: on Windows, resolving already split a "\" inside a name.
+  const platform = yield* HostProcess.Platform;
+  const names = relativePath.split("/").filter((name) => !["", ".", ".."].includes(name));
+  if (!names.every((name) => isValidHostFileName(name, platform))) {
+    return rejectTarget("Not a valid file name on the host (Windows).");
   }
   if (NodePath.basename(resolved.absolutePath).endsWith(WORKSPACE_UPLOAD_PART_SUFFIX)) {
     return rejectTarget("This file name is reserved for uploads in progress.");
