@@ -44,6 +44,24 @@ describe("ProjectPrepareUploadInput", () => {
     ).toThrow();
   });
 
+  it("keeps leading and trailing spaces in upload paths", () => {
+    // " notes.txt" is a valid name; trimming it would upload under another name.
+    const decoded = decodeInput({
+      cwd: "/workspace",
+      directories: [" folder "],
+      files: [{ relativePath: " notes.txt ", sizeBytes: 1, onConflict: "fail" }],
+    });
+    expect(decoded.directories).toEqual([" folder "]);
+    expect(decoded.files[0]?.relativePath).toBe(" notes.txt ");
+    expect(() =>
+      decodeInput({
+        cwd: "/workspace",
+        directories: [],
+        files: [{ relativePath: "", sizeBytes: 1, onConflict: "fail" }],
+      }),
+    ).toThrow();
+  });
+
   it("caps the number of files per call", () => {
     const files = Array.from({ length: WORKSPACE_UPLOAD_MAX_FILES + 1 }, (_, index) => ({
       relativePath: `f${index}.txt`,
@@ -72,5 +90,17 @@ describe("ProjectPrepareUploadResult", () => {
       ],
     });
     expect(result.files.map((file) => file.status)).toEqual(["ready", "conflict", "rejected"]);
+  });
+
+  it("echoes upload paths with their spaces, so the client can match them", () => {
+    const result = decodeResult({
+      files: [
+        { relativePath: " notes.txt", status: "conflict", existingKind: "file" },
+        { relativePath: "a. ", status: "rejected", reason: "Not a valid file name." },
+      ],
+      rejectedDirectories: [{ relativePath: " folder", reason: "Blocked." }],
+    });
+    expect(result.files.map((file) => file.relativePath)).toEqual([" notes.txt", "a. "]);
+    expect(result.rejectedDirectories[0]?.relativePath).toBe(" folder");
   });
 });

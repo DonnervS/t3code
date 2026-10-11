@@ -18,7 +18,12 @@ const WORKSPACE_UPLOAD_PATH_MAX_LENGTH = 1024;
 export const WorkspaceUploadConflictMode = Schema.Literals(["fail", "replace", "keepBoth"]);
 export type WorkspaceUploadConflictMode = typeof WorkspaceUploadConflictMode.Type;
 
-const WorkspaceUploadPath = TrimmedNonEmptyString.check(
+/**
+ * Not trimmed: " notes.txt" is a valid name on every host, and the client matches
+ * results to its files by this exact string.
+ */
+const WorkspaceUploadPath = Schema.String.check(
+  Schema.isNonEmpty(),
   Schema.isMaxLength(WORKSPACE_UPLOAD_PATH_MAX_LENGTH),
 );
 
@@ -42,18 +47,18 @@ export type ProjectPrepareUploadInput = typeof ProjectPrepareUploadInput.Type;
 
 export const ProjectPrepareUploadFileResult = Schema.Union([
   Schema.Struct({
-    relativePath: TrimmedNonEmptyString,
+    relativePath: WorkspaceUploadPath,
     status: Schema.Literal("ready"),
     relativeUrl: TrimmedNonEmptyString.check(Schema.isMaxLength(8192)),
     expiresAt: Schema.Number,
   }),
   Schema.Struct({
-    relativePath: TrimmedNonEmptyString,
+    relativePath: WorkspaceUploadPath,
     status: Schema.Literal("conflict"),
     existingKind: Schema.Literals(["file", "directory"]),
   }),
   Schema.Struct({
-    relativePath: TrimmedNonEmptyString,
+    relativePath: WorkspaceUploadPath,
     status: Schema.Literal("rejected"),
     reason: TrimmedNonEmptyString,
   }),
@@ -64,7 +69,7 @@ export const ProjectPrepareUploadResult = Schema.Struct({
   /** One entry per input file, in input order. */
   files: Schema.Array(ProjectPrepareUploadFileResult),
   rejectedDirectories: Schema.Array(
-    Schema.Struct({ relativePath: TrimmedNonEmptyString, reason: TrimmedNonEmptyString }),
+    Schema.Struct({ relativePath: WorkspaceUploadPath, reason: TrimmedNonEmptyString }),
   ),
 });
 export type ProjectPrepareUploadResult = typeof ProjectPrepareUploadResult.Type;

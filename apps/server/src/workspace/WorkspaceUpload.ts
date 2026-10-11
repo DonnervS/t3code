@@ -38,7 +38,6 @@ import {
 } from "../auth/utils.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as WorkspaceEntries from "./WorkspaceEntries.ts";
-import * as WorkspacePaths from "./WorkspacePaths.ts";
 
 // Shared with asset and attachment tokens; the signed `kind` keeps them apart.
 const SIGNING_SECRET_NAME = "asset-access-signing-key";
@@ -107,27 +106,44 @@ async function isInsideRealRoot(realRoot: string, absolutePath: string): Promise
   }
 }
 
+/**
+ * `WorkspacePaths.resolveRelativePathWithinRoot` without its trimming: " notes.txt" is a
+ * real name and must never land on "notes.txt".
+ */
+function resolveWithinRoot(
+  cwd: string,
+  relativePath: string,
+): { absolutePath: string; relativePath: string } | null {
+  if (NodePath.isAbsolute(relativePath)) return null;
+  const absolutePath = NodePath.resolve(cwd, relativePath);
+  const relativeToRoot = toPosixPath(NodePath.relative(cwd, absolutePath));
+  if (
+    relativeToRoot === "" ||
+    relativeToRoot === ".." ||
+    relativeToRoot.startsWith("../") ||
+    NodePath.isAbsolute(relativeToRoot)
+  ) {
+    return null;
+  }
+  return { absolutePath, relativePath: relativeToRoot };
+}
+
 export const resolveUploadTarget = Effect.fn("WorkspaceUpload.resolveTarget")(function* (
   realRoot: string,
   cwd: string,
   relativePath: string,
 ) {
-  const workspacePaths = yield* WorkspacePaths.WorkspacePaths;
-  const resolved = yield* workspacePaths
-    .resolveRelativePathWithinRoot({ workspaceRoot: cwd, relativePath })
-    .pipe(Effect.option);
-  if (Option.isNone(resolved)) return rejectTarget("Outside the project folder.");
-  if (hasGitSegment(resolved.value.relativePath.split("/"))) {
+  const resolved = resolveWithinRoot(cwd, relativePath);
+  if (resolved === null) return rejectTarget("Outside the project folder.");
+  if (hasGitSegment(resolved.relativePath.split("/"))) {
     return rejectTarget("Uploads into .git are not allowed.");
   }
-  if (NodePath.basename(resolved.value.absolutePath).endsWith(WORKSPACE_UPLOAD_PART_SUFFIX)) {
+  if (NodePath.basename(resolved.absolutePath).endsWith(WORKSPACE_UPLOAD_PART_SUFFIX)) {
     return rejectTarget("This file name is reserved for uploads in progress.");
   }
-  const inside = yield* Effect.promise(() =>
-    isInsideRealRoot(realRoot, resolved.value.absolutePath),
-  );
+  const inside = yield* Effect.promise(() => isInsideRealRoot(realRoot, resolved.absolutePath));
   if (!inside) return rejectTarget("Outside the project folder.");
-  return { ok: true, ...resolved.value } satisfies UploadTarget as UploadTarget;
+  return { ok: true, ...resolved } satisfies UploadTarget as UploadTarget;
 });
 
 /** `null` when nothing is there. Unreadable entries count as files, so they show as conflicts. */

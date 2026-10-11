@@ -444,6 +444,20 @@ it.layer(layerTest)("WorkspaceUpload.store", (it) => {
       }),
   );
 
+  it.effect("keeps leading spaces in names instead of writing to the trimmed name", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTempDir;
+      writeFile(cwd, "notes.txt", "existing");
+      const claims = yield* prepareOne(cwd, " notes.txt", "new", "fail");
+      expect(yield* storeWorkspaceUpload(claims, bytes("new"))).toEqual({
+        ok: true,
+        relativePath: " notes.txt",
+      });
+      expect(NodeFS.readFileSync(NodePath.join(cwd, " notes.txt"), "utf8")).toBe("new");
+      expect(NodeFS.readFileSync(NodePath.join(cwd, "notes.txt"), "utf8")).toBe("existing");
+    }),
+  );
+
   it.effect("rejects with 403 when the path stopped being allowed after signing", () =>
     Effect.gen(function* () {
       const cwd = yield* makeTempDir;
