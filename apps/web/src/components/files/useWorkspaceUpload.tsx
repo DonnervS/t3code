@@ -9,6 +9,10 @@ import type { DroppedEntries } from "~/lib/workspaceUpload/collectDroppedEntries
 import { workspaceUploadConflictQueue } from "~/lib/workspaceUpload/conflictQueue";
 import { sendUploadBytes } from "~/lib/workspaceUpload/sendUploadBytes";
 import {
+  workspaceFilesChanged,
+  workspaceFilesKey,
+} from "~/lib/workspaceUpload/workspaceFilesChanged";
+import {
   startWorkspaceUpload,
   type WorkspaceUploadProgress,
   type WorkspaceUploadSummary,
@@ -83,6 +87,7 @@ function startUpload(
 ) {
   if (entries.files.length === 0 && entries.directories.length === 0) return;
   const targetLabel = targetDirectory === "" ? projectName : `${targetDirectory}/`;
+  const filesKey = workspaceFilesKey(environmentId, cwd);
   let lastToastUpdate = 0;
   let cancelRun = () => {};
   let cancelled = false;
@@ -110,6 +115,7 @@ function startUpload(
       lastToastUpdate = now;
       toastManager.update(toastId, { description: progressDescription(progress) });
     },
+    onFileUploaded: () => workspaceFilesChanged.notify(filesKey),
     deps: {
       prepare: async (input) => {
         const result = await runAtomCommand(
@@ -137,6 +143,8 @@ function startUpload(
   });
   cancelRun = run.cancel;
   void run.done.then((summary) => {
+    // Also covers folders created at prepare and files stored before a cancel.
+    workspaceFilesChanged.flush(filesKey);
     toastManager.close(toastId);
     showSummary(summary, targetLabel);
   });

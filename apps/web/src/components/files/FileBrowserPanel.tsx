@@ -27,6 +27,10 @@ import {
   collectDroppedEntries,
   type DropEntryLike,
 } from "~/lib/workspaceUpload/collectDroppedEntries";
+import {
+  workspaceFilesChanged,
+  workspaceFilesKey,
+} from "~/lib/workspaceUpload/workspaceFilesChanged";
 
 import { createFileTreeDragMentionController } from "./fileTreeDragMention";
 import { areAllDirectoriesExpanded, setAllDirectoriesExpanded } from "./fileTreeExpansion";
@@ -378,19 +382,31 @@ export default function FileBrowserPanel({
     }
     search.setValue(value);
   };
-  const handleRefresh = () => {
+  const refreshTree = () => {
     refresh();
     if (query.trim()) pathSearch.refresh();
+  };
+  const handleRefresh = () => {
+    refreshTree();
     onRefreshSelectedFile?.();
   };
   useWorkspaceMutationRefresh({
     mutationId: workspaceMutationId,
-    refresh: () => {
-      refresh();
-      if (query.trim()) pathSearch.refresh();
-    },
+    refresh: refreshTree,
     resourceKey: `files:${environmentId}:${cwd}`,
   });
+  // Uploads re-list the folders on screen as files land; the runs outlive this panel.
+  const refreshTreeRef = useRef(refreshTree);
+  useEffect(() => {
+    refreshTreeRef.current = refreshTree;
+  });
+  useEffect(
+    () =>
+      workspaceFilesChanged.subscribe(workspaceFilesKey(environmentId, cwd), () =>
+        refreshTreeRef.current(),
+      ),
+    [cwd, environmentId],
+  );
 
   useEffect(() => {
     if (!ready) return;

@@ -74,6 +74,8 @@ export function startWorkspaceUpload(input: {
   readonly entries: DroppedEntries;
   readonly deps: WorkspaceUploadDeps;
   readonly onProgress: (progress: WorkspaceUploadProgress) => void;
+  /** A file is in place on the host, under its final relative path. */
+  readonly onFileUploaded?: (relativePath: string) => void;
   readonly concurrency?: number;
 }): { readonly done: Promise<WorkspaceUploadSummary>; readonly cancel: () => void } {
   const { deps } = input;
@@ -242,8 +244,10 @@ export function startWorkspaceUpload(input: {
       activeTransfers.delete(transfer);
     }
     if (response.status >= 200 && response.status < 300) {
-      uploaded.push(response.body || item.relativePath);
+      const finalPath = response.body || item.relativePath;
+      uploaded.push(finalPath);
       finish(item.relativePath, true);
+      input.onFileUploaded?.(finalPath);
       return "done";
     }
     loadedBytes.set(item.relativePath, 0);
