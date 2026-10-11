@@ -52,8 +52,21 @@ function showSummary(summary: WorkspaceUploadSummary, targetLabel: string) {
   toastManager.add({
     type: "error",
     title: `${summary.failed.length} ${summary.failed.length === 1 ? "file was" : "files were"} not uploaded`,
-    description: [parts.join(", "), ...listed].join("\n"),
+    description: parts.join(", "),
     timeout: 0,
+    data: {
+      // One line per failure; a plain description renders as a single paragraph.
+      expandableContent: (
+        <ul className="space-y-1 text-muted-foreground">
+          {listed.map((line) => (
+            <li key={line} className="wrap-break-word">
+              {line}
+            </li>
+          ))}
+        </ul>
+      ),
+      expandableLabels: { collapse: "Hide files", expand: "Show files" },
+    },
   });
 }
 
